@@ -90,11 +90,22 @@ async fn connect_and_stream(
         request.metadata_mut().insert("x-token", metadata_value);
     }
 
+    let ctx = zmq::Context::new();
+    let zmq_socket = match ctx.socket(zmq::SocketType::PUSH) {
+        Ok(socket) => socket,
+        Err(e) => return Err(Box::new(e)),
+    };
+    match zmq_socket.connect("tcp://0.0.0.0:5557") {
+        Ok(_) => {}
+        Err(e) => return Err(Box::new(e)),
+    };
+
     let mut stream = client.subscribe_entries(request).await?.into_inner();
 
     while let Some(result) = stream.message().await.transpose() {
         match result {
             Ok(slot_entry) => {
+                let recv_ts_us = unix_ts_us();
                 let entries = match bincode::deserialize::<Vec<Entry>>(&slot_entry.entries) {
                     Ok(e) => e,
                     Err(e) => {
@@ -102,13 +113,6 @@ async fn connect_and_stream(
                         continue;
                     }
                 };
-
-                // println!(
-                //     "slot {}, entries: {}, transactions: {}",
-                //     slot_entry.slot,
-                //     entries.len(),
-                //     entries.iter().map(|e| e.transactions.len()).sum::<usize>()
-                // );
 
                 entries.iter().for_each(|e| {
                     e.transactions.iter().for_each(|t| {
@@ -120,10 +124,19 @@ async fn connect_and_stream(
                             // Keys provided → print only if any matches
                             Some(s) => accounts.iter().any(|key| s.contains(key)),
                         };
+                        let raw_tx_str = serde_json::json!({
+                            "recv_ts_us": recv_ts_us,
+                            "txn_signatures": t.signatures
+                        })
+                        .to_string();
+                        let topic = "shred_stream";
+                        let payload = format!("{topic} {raw_tx_str}");
+                        let _ = zmq_socket.send(&payload, zmq::DONTWAIT);
 
-                        if should_print {
-                            println!("Transaction: {:?}\n", t);
-                        }
+                        // if should_print {
+                        //     println!("Times {}", recv_ts_us);
+                        //     println!("Transaction: {:?}\n", t.signatures);
+                        // }
                     });
                 });
             }
@@ -135,4 +148,12 @@ async fn connect_and_stream(
     }
 
     Ok(())
+}
+
+#[allow(clippy::expect_used)]
+pub fn unix_ts_us() -> u64 {
+    std::time::UNIX_EPOCH
+        .elapsed()
+        .expect("System time is ealier than 1970-01-01")
+        .as_micros() as u64
 }
